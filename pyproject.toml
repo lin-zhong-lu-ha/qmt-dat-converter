@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qmt-dat-converter"
+version = "0.2.0"
+description = "Offline conversion of local QMT DAT files to Parquet"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["numpy>=2.1", "pyarrow>=23"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_default_fixture_loop_scope = "function"

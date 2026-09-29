@@ -1,0 +1,57 @@
+# Per-machine settings and credentials (including interrupted atomic saves).
+config.local.json*
+config.*.local.json*
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+secrets*
+
+# Source data, derived data, state and reports belong outside the repository.
+*.[dD][aA][tT]
+*.parquet
+*.PARQUET
+*.arrow
+*.feather
+*.sqlite*
+*.db
+*.db-*
+*.log
+*.zip
+*.7z
+*.bak
+*.tmp
+.qmt-converter.json
+.qmt-converter.lock
+.state/
+.staging/
+.journal/
+datadir/
+data/
+output/
+outputs/
+local_outputs/
+reports/
+
+# Python environments and build/test output.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Local editor and development records.
+.idea/
+.vscode/
+.superpowers/
+.codex/
+Thumbs.db
+.DS_Store

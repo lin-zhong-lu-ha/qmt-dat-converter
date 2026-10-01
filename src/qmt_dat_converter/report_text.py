@@ -50,13 +50,24 @@ def format_report(report: dict) -> str:
              f"转换一致性: {STATUS.get(verification['conversion_consistency']['status'], verification['conversion_consistency']['status'])}",
              f"覆盖范围: {STATUS.get(verification['coverage']['status'], verification['coverage']['status'])}",
              f"外部证据: {external_text}",
-             f"字段映射: {STATUS.get(verification['field_profile']['status'], verification['field_profile']['status'])}", "",
+             f"字段映射: {STATUS.get(verification['field_profile']['status'], verification['field_profile']['status'])}",
+             f"价格校验范围: {scope['start'] or '不限'} 至 {scope['end'] or '不限'}；范围外异常只警告", "",
              "排除与问题",
-             f"排除项: {sum(item['category'] != 'error' for item in report['issues'])}",
+             f"排除项: {sum(item['category'] in {'excluded', 'malformed'} for item in report['issues'])}",
+             f"警告: {sum(item['category'] == 'warning' for item in report['issues'])}",
              f"错误: {sum(item['category'] == 'error' for item in report['issues'])}"]
     if report["issues"]:
         for issue in report["issues"]:
             lines.append(f"[{issue['category']}] {issue['reason']} {issue.get('path', '')}".rstrip())
+            if issue["reason"] in {"invalid-ohlc", "invalid-ohlc-outside-scope"}:
+                impact = "范围内异常，阻止发布" if issue.get("blocking", True) else "范围外异常，不阻塞本次转换"
+                lines.append(f"  {issue.get('code', '')} | {impact} | 异常记录 {issue.get('count', 0)} 条")
+                for row in issue.get("rows", []):
+                    lines.append(f"  {row['date']} | 开盘 {row['open']} | 最高 {row['high']} | 最低 {row['low']} | 收盘 {row['close']}")
+                if issue.get("count", 0) > len(issue.get("rows", [])):
+                    lines.append("  仅展示前10条，完整异常日期见JSON的days字段")
+            if issue["reason"] == "partition-unpublishable":
+                lines.append(f"  未更新分区: {issue.get('path', '')} | 阻塞股票: {', '.join(issue.get('blocking_codes', [])) or '详见前述错误'}")
     else:
         lines.append("无")
     lines += ["", f"JSON 报告: {report['paths']['report']}"]

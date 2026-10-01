@@ -9,6 +9,12 @@ class ConverterError(Exception):
     pass
 
 
+class RecordValidationError(ConverterError):
+    def __init__(self, reason: str, details: dict):
+        super().__init__(reason)
+        self.details = details
+
+
 class Cancelled(ConverterError):
     pass
 
@@ -75,3 +81,4 @@ class Decoded:
     table: pa.Table
     days: dict[str, dict]
     profile: str
+    warnings: tuple[dict, ...] = ()

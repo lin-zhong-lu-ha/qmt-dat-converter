@@ -24,6 +24,7 @@ from .storage import (PARQUET_OPTIONS, check_sources, file_hash, merge, partitio
 
 def _issue(report, reason, path=None, category="error"):
     item = {"category": category, "reason": str(reason)}
+    item.update(getattr(reason, "details", {}))
     if path is not None:
         item["path"] = str(path)
     report["issues"].append(item)
@@ -121,10 +122,14 @@ def _process(config, root, sources, report, action, progress, cancel):
         inventory = {str(source.path.relative_to(config.source)): source for source in sources}
         blocked = set()
         block_all = set()
+        blocking_codes = defaultdict(set)
+        group_blocking_codes = defaultdict(set)
         for path, old in previous.items():
             if path not in inventory:
                 _issue(report, "source-missing", config.source / path)
                 _block_source(db, old["id"], blocked)
+                for row in db.execute("SELECT DISTINCT partition FROM days WHERE source_id=?", (old["id"],)):
+                    blocking_codes[row[0]].add(old["code"])
         scope_sql = "s.period IN (" + ",".join("?" for _ in config.periods) + ")"
         scope_args = list(config.periods)
         if config.codes:
@@ -168,7 +173,9 @@ def _process(config, root, sources, report, action, progress, cancel):
                 report["counts"]["content_revalidated_files"] += 1
                 if old["signature"] and snapshot.signature["size"] < json.loads(old["signature"])["size"]:
                     raise ConverterError("source-shrunk")
-                decoded = decode(snapshot, source)
+                decoded = decode(snapshot, source, validation_start=config.start, validation_end=config.end)
+                for warning in decoded.warnings:
+                    report["issues"].append({**warning, "path": str(source.path)})
                 if set(old_days) - set(decoded.days):
                     raise ConverterError("removed-days")
                 evidence.compare(source, decoded.table)
@@ -190,8 +197,16 @@ def _process(config, root, sources, report, action, progress, cancel):
             except (ConverterError, OSError, ValueError, pa.ArrowException, sqlite3.Error) as exc:
                 _issue(report, exc, source.path)
                 _block_source(db, source_id, blocked)
+                for row in db.execute("SELECT DISTINCT partition FROM days WHERE source_id=?", (source_id,)):
+                    blocking_codes[row[0]].add(source.code)
+                for day in getattr(exc, "details", {}).get("days", []):
+                    partition = partition_path(source, day)
+                    blocked.add(partition)
+                    blocking_codes[partition].add(source.code)
                 if not old_days:
-                    block_all.add((source.period, source.market, source.kind))
+                    group = (source.period, source.market, source.kind)
+                    block_all.add(group)
+                    group_blocking_codes[group].add(source.code)
             _emit(progress, event="source_complete", index=index + 1, total=len(sources), code=source.code, period=source.period)
         external = evidence.result()
         report["verification"]["external_evidence"] = external
@@ -207,10 +222,12 @@ def _process(config, root, sources, report, action, progress, cancel):
             affected.update(row[0] for row in db.execute("SELECT DISTINCT source_id FROM days WHERE partition=?", (partition,)))
             identities = []
             unpublishable = partition in blocked or evidence_failed
+            causes = set(blocking_codes[partition])
             for source_id in affected:
                 source_row = db.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
                 if (source_row["period"], source_row["market"], source_row["kind"]) in block_all:
                     unpublishable = True
+                    causes.update(group_blocking_codes[(source_row["period"], source_row["market"], source_row["kind"])])
                 info = source_info.get(source_id)
                 if info is None:
                     if source_row["signature"] and source_row["sha256"]:
@@ -221,6 +238,7 @@ def _process(config, root, sources, report, action, progress, cancel):
                     identities.append(info)
             if unpublishable:
                 _issue(report, "partition-unpublishable", partition)
+                report["issues"][-1]["blocking_codes"] = sorted(causes)
                 continue
             try:
                 target = safe_path(root, partition)
@@ -293,6 +311,7 @@ def run(config, action="convert", progress=None, cancel=None) -> dict:
               "issues": [], "paths": {"source": str(config.source), "output": str(config.output),
                                       "report": None, "text_report": None},
               "verification": initial_verification()}
+    report["verification"]["conversion_consistency"]["validation_scope"] = {"start": config.start, "end": config.end}
     try:
         if action not in {"convert", "scan", "verify"}:
             raise ConverterError("invalid-action")

@@ -27,3 +27,22 @@ def test_external_evidence_wording_preserves_provenance_and_match_counts():
     independent["verification"]["external_evidence"]["provenance"] = "independent"
     separate = format_report(independent)
     assert "独立来源" in separate and "未经认证" in separate and "725/725" in separate
+
+
+def test_scope_warning_and_blocked_partition_explain_dates_and_prices():
+    report = base_report()
+    report["scope"].update(start="2026-09-22", end="2026-09-22")
+    report["verification"]["conversion_consistency"]["validation_scope"] = {
+        "start": "2026-09-22", "end": "2026-09-22"}
+    report["issues"] = [
+        {"category": "warning", "reason": "invalid-ohlc-outside-scope", "path": "600000.DAT",
+         "code": "600000.SH", "count": 1, "blocking": False,
+         "rows": [{"date": "1994-04-04", "open": 6.06, "high": 6.0, "low": 5.61, "close": 5.7}]},
+        {"category": "error", "reason": "partition-unpublishable",
+         "path": "data/qmt-daily-monthly/2026/09/SH.parquet", "blocking_codes": ["600001.SH"]},
+    ]
+    text = format_report(report)
+    assert "1994-04-04" in text and "6.06" in text and "6.0" in text
+    assert "范围外" in text and "不阻塞" in text
+    assert "警告: 1" in text and "排除项: 0" in text
+    assert "未更新分区" in text and "600001.SH" in text

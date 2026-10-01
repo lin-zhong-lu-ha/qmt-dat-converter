@@ -116,6 +116,42 @@ def test_date_bounds_are_inclusive_and_use_beijing_date(row):
     assert list(decoded.days) == ["20260922"]
 
 
+def test_outside_scope_ohlc_is_reported_without_exporting_invalid_history(row):
+    bad = list(row)
+    bad[0] = 765388800  # 1994-04-04 00:00 Beijing
+    bad[1:5] = [6060, 6000, 5610, 5700]
+    decoded = decode(snapshot(bad, row), source("1d"), "20260922", "20260922")
+    assert decoded.table["trade_date"].to_pylist() == ["20260922"]
+    assert decoded.table["open"].to_pylist() == [7.1]
+    issue = decoded.warnings[0]
+    assert issue["reason"] == "invalid-ohlc-outside-scope"
+    assert issue["count"] == 1
+    assert issue["rows"][0]["date"] == "1994-04-04"
+    assert issue["rows"][0]["open"] == 6.06
+    assert issue["rows"][0]["high"] == 6.0
+
+
+def test_in_scope_ohlc_error_contains_date_and_values(row):
+    bad = list(row)
+    bad[1] = 7400
+    with pytest.raises(ConverterError, match="invalid-ohlc") as failure:
+        decode(snapshot(bad), source("1d"), "20260922", "20260922")
+    assert failure.value.details["count"] == 1
+    assert failure.value.details["rows"][0]["date"] == "2026-09-22"
+    assert failure.value.details["rows"][0]["open"] == 7.4
+    assert failure.value.details["rows"][0]["high"] == 7.35
+
+
+def test_range_still_rejects_structural_timestamp_and_record_errors(row):
+    bad = list(row)
+    bad[0] = 0
+    with pytest.raises(ConverterError, match="time-order"):
+        decode(snapshot(bad, row), source("1d"), "20260922", "20260922")
+    raw = snapshot(row).raw + b"truncated"
+    with pytest.raises(ConverterError, match="length"):
+        decode(Snapshot(raw, {}, ""), source("1d"), "20260922", "20260922")
+
+
 def test_digest_is_sorted_and_sensitive_to_business_value(row):
     first = decode(snapshot(row), source()).table
     next_row = list(row)

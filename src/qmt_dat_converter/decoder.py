@@ -5,7 +5,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from .model import ConverterError, Decoded, Snapshot, SourceFile, normalize_date
+from .model import ConverterError, Decoded, RecordValidationError, Snapshot, SourceFile, normalize_date
 
 
 HEADER = bytes.fromhex("feffffffffffff7f")
@@ -46,7 +46,8 @@ def single_row_digests(table: pa.Table) -> list[str]:
     return [hashlib.sha256(prefix + b"".join(values)).hexdigest() for values in zip(*columns)]
 
 
-def decode(snapshot: Snapshot, source: SourceFile, start=None, end=None) -> Decoded:
+def decode(snapshot: Snapshot, source: SourceFile, start=None, end=None, *,
+           validation_start=None, validation_end=None) -> Decoded:
     raw = snapshot.raw
     if len(raw) < 8 or raw[:8] != HEADER:
         raise ConverterError("unknown-header")
@@ -60,24 +61,48 @@ def decode(snapshot: Snapshot, source: SourceFile, start=None, end=None) -> Deco
     last = normalize_date(end)
     if first and last and first > last:
         raise ConverterError("invalid-date-range")
+    validation_first = normalize_date(validation_start) if validation_start is not None else first
+    validation_last = normalize_date(validation_end) if validation_end is not None else last
+    if validation_first and validation_last and validation_first > validation_last:
+        raise ConverterError("invalid-date-range")
 
     words = np.frombuffer(raw, dtype="<u4", offset=8).reshape(-1, 16)
     seconds = words[:, 0].astype(np.int64)
     if np.any(seconds == 0) or np.any(np.diff(seconds) <= 0):
         raise ConverterError("invalid-time-order")
+    local_clocks = (seconds + 8 * 3600).astype("datetime64[s]")
+    local_days = local_clocks.astype("datetime64[D]")
+    validation_scope = np.ones(len(words), dtype=np.bool_)
+    if validation_first:
+        validation_scope &= local_days >= np.datetime64(validation_first)
+    if validation_last:
+        validation_scope &= local_days <= np.datetime64(validation_last)
     prices = words[:, 1:5]
-    if (np.any(prices == 0)
-            or np.any(prices[:, 1, None] < prices[:, [0, 2, 3]])
-            or np.any(prices[:, 2, None] > prices[:, [0, 1, 3]])):
-        raise ConverterError("invalid-ohlc")
+    bad_ohlc = (np.any(prices == 0, axis=1)
+                | np.any(prices[:, 1, None] < prices[:, [0, 2, 3]], axis=1)
+                | np.any(prices[:, 2, None] > prices[:, [0, 1, 3]], axis=1))
+    warnings = []
+    if np.any(bad_ohlc):
+        for blocking in (True, False):
+            indices = np.flatnonzero(bad_ohlc & (validation_scope if blocking else ~validation_scope))
+            if not len(indices):
+                continue
+            detail = {"code": source.code, "period": source.period, "count": len(indices),
+                      "blocking": blocking, "days": [str(day).replace("-", "") for day in np.unique(local_days[indices])],
+                      "rows": [{"record": int(i), "date": str(local_days[i]),
+                                "datetime": str(local_clocks[i]).replace("T", " "),
+                                **{name: int(words[i, column]) / 1000
+                                   for column, name in enumerate(("open", "high", "low", "close"), 1)}}
+                               for i in indices[:10]]}
+            if blocking:
+                raise RecordValidationError("invalid-ohlc", detail)
+            warnings.append({"category": "warning", "reason": "invalid-ohlc-outside-scope", **detail})
     if np.any(words[:, 14] != 0):
         raise ConverterError("unknown-status")
     amount = words[:, 8].astype(np.uint64) | (words[:, 9].astype(np.uint64) << 32)
     if np.any(amount > 2**53):
         raise ConverterError("amount-not-exactly-representable")
 
-    local_clocks = (seconds + 8 * 3600).astype("datetime64[s]")
-    local_days = local_clocks.astype("datetime64[D]")
     selected = np.ones(len(words), dtype=np.bool_)
     if first:
         selected &= local_days >= np.datetime64(first)
@@ -121,7 +146,7 @@ def decode(snapshot: Snapshot, source: SourceFile, start=None, end=None) -> Deco
         }
         if source.period == "1d":
             days[day]["preclose_raw"] = words[first_record:last_record, 13].tolist()
-    return Decoded(table, days, PROFILE)
+    return Decoded(table, days, PROFILE, tuple(warnings))
 
 
 def table_digest(table: pa.Table) -> str:

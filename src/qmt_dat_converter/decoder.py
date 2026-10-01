@@ -47,7 +47,7 @@ def single_row_digests(table: pa.Table) -> list[str]:
 
 
 def decode(snapshot: Snapshot, source: SourceFile, start=None, end=None, *,
-           validation_start=None, validation_end=None) -> Decoded:
+           validation_start=None, validation_end=None, extra_timestamps=()) -> Decoded:
     raw = snapshot.raw
     if len(raw) < 8 or raw[:8] != HEADER:
         raise ConverterError("unknown-header")
@@ -72,6 +72,7 @@ def decode(snapshot: Snapshot, source: SourceFile, start=None, end=None, *,
         raise ConverterError("invalid-time-order")
     local_clocks = (seconds + 8 * 3600).astype("datetime64[s]")
     local_days = local_clocks.astype("datetime64[D]")
+    source_days = tuple(str(day).replace("-", "") for day in np.unique(local_days))
     validation_scope = np.ones(len(words), dtype=np.bool_)
     if validation_first:
         validation_scope &= local_days >= np.datetime64(validation_first)
@@ -108,6 +109,8 @@ def decode(snapshot: Snapshot, source: SourceFile, start=None, end=None, *,
         selected &= local_days >= np.datetime64(first)
     if last:
         selected &= local_days <= np.datetime64(last)
+    if extra_timestamps:
+        selected |= np.isin(seconds * 1000, np.asarray(extra_timestamps, dtype=np.int64))
     positions = np.flatnonzero(selected)
     selected_words = words[selected]
     selected_seconds = seconds[selected]
@@ -138,15 +141,20 @@ def decode(snapshot: Snapshot, source: SourceFile, start=None, end=None, *,
         day = str(local_day).replace("-", "")
         first_record = int(positions[offset])
         last_record = int(positions[offset + count - 1]) + 1
+        if last_record - first_record == count:
+            day_raw = raw[8 + first_record * 64:8 + last_record * 64]
+        else:
+            day_raw = b"".join(raw[8 + int(position) * 64:8 + (int(position) + 1) * 64]
+                               for position in positions[offset:offset + count])
         day_table = table.slice(int(offset), int(count))
         days[day] = {
-            "raw_hash": hashlib.sha256(raw[8 + first_record * 64:8 + last_record * 64]).hexdigest(),
+            "raw_hash": hashlib.sha256(day_raw).hexdigest(),
             "digest": single_digests[int(offset)] if single_digests is not None else table_digest(day_table),
             "rows": int(count),
         }
         if source.period == "1d":
-            days[day]["preclose_raw"] = words[first_record:last_record, 13].tolist()
-    return Decoded(table, days, PROFILE, tuple(warnings))
+            days[day]["preclose_raw"] = selected_words[offset:offset + count, 13].tolist()
+    return Decoded(table, days, PROFILE, tuple(warnings), source_days)
 
 
 def table_digest(table: pa.Table) -> str:

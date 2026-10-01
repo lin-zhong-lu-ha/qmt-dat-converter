@@ -27,7 +27,13 @@ def format_report(report: dict) -> str:
              f"发现新增源日期: {counts['new_days']}",
              f"发现修订源日期: {counts['revised_days']}",
              f"发现复用源日期: {counts['reused_days']}",
+             f"已复用校验范围的源文件: {counts.get('scope_reused_files', 0)}",
              f"已写入分区: {counts['written_partitions']}"]
+    if report.get("timings"):
+        phase_names = {"scan": "扫描", "check": "检查", "source": "源文件处理", "publish": "发布", "report": "报告"}
+        lines += ["", "阶段耗时"]
+        for phase, elapsed in report.get("timings", {}).items():
+            lines.append(f"{phase_names.get(phase, phase)}: {elapsed:.3f} 秒")
     if report["action"] == "verify":
         lines.append(f"核验模式内容比对分区: {counts['content_verified_partitions']}")
     external = verification["external_evidence"]

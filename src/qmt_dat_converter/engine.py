@@ -17,17 +17,74 @@ from .evidence import Evidence, initial_verification
 from .model import Cancelled, ConverterError
 from .report_text import write_text_report
 from .source import _signature, scan_sources, read_snapshot
-from .state import RULE_VERSION, connect, output_lock, own_output, safe_path, write_json
+from .state import (RULE_VERSION, VALIDATION_VERSION, connect, output_lock,
+                    own_output, safe_path, write_json)
 from .storage import (PARQUET_OPTIONS, check_sources, file_hash, merge, partition_path,
                       publish, read_table, recover, sorted_table)
 
 
-def _issue(report, reason, path=None, category="error"):
+def _issue(report, reason, path=None, category="error", **details):
     item = {"category": category, "reason": str(reason)}
     item.update(getattr(reason, "details", {}))
     if path is not None:
         item["path"] = str(path)
+    item.update(details)
     report["issues"].append(item)
+
+
+class _LiveIssues(list):
+    """Observe all appends, including recovery, without rescanning prior issues."""
+
+    def __init__(self, progress):
+        super().__init__()
+        self.progress = progress
+
+    def append(self, item):
+        super().append(item)
+        category = item["category"]
+        counts = self.progress.report["issue_counts"]
+        counts[category] = counts.get(category, 0) + 1
+        if category in {"error", "warning"}:
+            self.progress.emit({"event": "issue", "issue": dict(item)})
+
+    def extend(self, items):
+        for item in items:
+            self.append(item)
+
+
+class _Progress:
+    PHASES = ("scan", "check", "source", "publish", "report")
+
+    def __init__(self, report, callback, started):
+        self.report, self.callback, self.started = report, callback, started
+        self.current = None
+        self.phase_started = started
+
+    def finish(self):
+        if self.current is not None:
+            self.report["timings"][self.current] = max(0.0, time.monotonic() - self.phase_started)
+            self.current = None
+            self.report["elapsed_seconds"] = max(0.0, time.monotonic() - self.started)
+
+    def phase(self, name):
+        self.finish()
+        self.current, self.phase_started = name, time.monotonic()
+        self.report["timings"].setdefault(name, 0.0)
+        self.emit({"event": "phase", "phase": name,
+                   "index": self.PHASES.index(name) + 1, "total": len(self.PHASES)})
+
+    def emit(self, event):
+        event = dict(event)
+        event["elapsed_seconds"] = max(0.0, time.monotonic() - self.started)
+        if event["event"] in {"issue", "scan_complete", "source_complete", "partition_complete"}:
+            event["issue_counts"] = dict(self.report["issue_counts"])
+        if event["event"] in {"scan_complete", "source_complete", "partition_complete"}:
+            event["counts"] = dict(self.report["counts"])
+            event["phase_elapsed_seconds"] = max(0.0, time.monotonic() - self.phase_started)
+        if self.callback is not None:
+            self.callback(event)
+
+    __call__ = emit
 
 
 def _check_cancel(cancel):
@@ -47,6 +104,48 @@ def _selected(day, config):
 
 def _in_scope(source, config):
     return source["period"] in config.periods and (not config.codes or source["code"] in config.codes)
+
+
+def _bounds(config):
+    return (config.start.replace("-", "") if config.start else "",
+            config.end.replace("-", "") if config.end else "99999999")
+
+
+def _partition_in_scope(day, period, config):
+    start, end = _bounds(config)
+    return start[:6] <= day[:6] <= end[:6] if period == "1d" else start <= day <= end
+
+
+def _range_receipt(db, old, source, config, checked, blocked):
+    """A validation receipt is evidence of this interval, never full history."""
+    start, end = _bounds(config)
+    signature = json.dumps(source.signature, sort_keys=True)
+    if old["signature"] != signature:
+        return None
+    for receipt in db.execute("SELECT * FROM scope_receipts WHERE source_id=? AND start<=? AND end>=?",
+                              (old["id"], start, end)):
+        if (receipt["signature"] != signature or receipt["sha256"] != old["sha256"]
+                or receipt["rule_version"] != RULE_VERSION or receipt["validation_version"] != VALIDATION_VERSION):
+            continue
+        manifest = json.loads(receipt["days"])
+        valid = True
+        for day, detail in manifest.items():
+            if not _selected(day, config):
+                continue
+            cached = db.execute("SELECT * FROM days WHERE source_id=? AND day=?", (old["id"], day)).fetchone()
+            if (cached is None or cached["partition"] not in checked or cached["partition"] in blocked
+                    or cached["rule_version"] != RULE_VERSION
+                    or any(cached[key] != detail[key] for key in ("raw_hash", "digest", "rows", "partition"))):
+                valid = False
+                break
+        if valid:
+            # Reject extra cached days not corroborated by the receipt as well.
+            cached_days = {row[0] for row in db.execute("SELECT day FROM days WHERE source_id=? AND day>=? AND day<=?",
+                                                       (old["id"], start, end))}
+            expected = {day for day in manifest if _selected(day, config)}
+            if cached_days == expected:
+                return receipt
+    return None
 
 
 def _block_source(db, source_id, blocked):
@@ -105,6 +204,7 @@ def _verify_rows(existing, incoming):
 
 
 def _process(config, root, sources, report, action, progress, cancel):
+    progress.phase("check")
     db = connect(root)
     try:
         if action == "convert":
@@ -113,14 +213,17 @@ def _process(config, root, sources, report, action, progress, cancel):
             raise ConverterError("pending-recovery-run-convert")
         if action == "scan":
             return
+        evidence_valid = True
         try:
             evidence = Evidence(config.evidence)
         except ConverterError as exc:
             _issue(report, exc)
             evidence = Evidence(None)
+            evidence_valid = False
         previous = {row["path"]: row for row in db.execute("SELECT * FROM sources") if _in_scope(row, config)}
         inventory = {str(source.path.relative_to(config.source)): source for source in sources}
         blocked = set()
+        checked = set()
         block_all = set()
         blocking_codes = defaultdict(set)
         group_blocking_codes = defaultdict(set)
@@ -135,6 +238,12 @@ def _process(config, root, sources, report, action, progress, cancel):
         if config.codes:
             scope_sql += " AND s.code IN (" + ",".join("?" for _ in config.codes) + ")"
             scope_args.extend(config.codes)
+        if action == "convert" and config.mode in {"incremental", "range"} and (config.start or config.end):
+            # Daily output is monthly: any cached day in an overlapping month
+            # makes the whole public partition relevant to this request.
+            start, end = _bounds(config)
+            scope_sql += " AND ((s.period='1d' AND substr(d.day,1,6)>=? AND substr(d.day,1,6)<=?) OR (s.period!='1d' AND d.day>=? AND d.day<=?))"
+            scope_args.extend((start[:6], end[:6], start, end))
         partition_query = "SELECT p.* FROM partitions p WHERE EXISTS (SELECT 1 FROM days d JOIN sources s ON s.id=d.source_id WHERE d.partition=p.path AND " + scope_sql + ")"
         for row in db.execute(partition_query, scope_args):
             path = safe_path(root, row["path"])
@@ -144,11 +253,14 @@ def _process(config, root, sources, report, action, progress, cancel):
                     if file_hash(path) != row["sha256"]:
                         raise ConverterError("output-tampered")
                 report["counts"]["checked_partitions"] += 1
+                checked.add(row["path"])
             except (ConverterError, OSError) as exc:
                 _issue(report, f"output-tampered: {exc}", path)
                 blocked.add(row["path"])
         source_info = {}
         completed_candidates = {}
+        reused_sources = {}
+        progress.phase("source")
         for index, source in enumerate(sources):
             _check_cancel(cancel)
             relative = str(source.path.relative_to(config.source))
@@ -158,25 +270,48 @@ def _process(config, root, sources, report, action, progress, cancel):
                            (relative, source.code, source.market, source.period, source.kind))
             old = db.execute("SELECT * FROM sources WHERE path=?", (relative,)).fetchone()
             source_id = old["id"]
+            old_days = {item["day"]: item for item in db.execute("SELECT * FROM days WHERE source_id=?", (source_id,))}
             can_reuse = (action == "convert" and config.mode == "incremental" and config.start is None and config.end is None
                          and old["complete"] and old["signature"] and json.loads(old["signature"]) == source.signature
-                         and not evidence.needs(source))
-            if can_reuse:
+                         and evidence_valid and not evidence.needs(source) and all(item["partition"] in checked and item["partition"] not in blocked
+                                                               for item in old_days.values()))
+            receipt = None
+            if (action == "convert" and config.mode in {"incremental", "range"} and (config.start or config.end)
+                    and evidence_valid and not evidence.needs(source)):
+                receipt = _range_receipt(db, old, source, config, checked, blocked)
+            if can_reuse or receipt is not None:
                 source_info[source_id] = {"path": relative, "signature": source.signature, "sha256": old["sha256"]}
-                report["counts"]["stat_reused_files"] += 1
-                report["counts"]["reused_days"] += old["day_count"]
+                try:
+                    check_sources(config.source, [source_info[source_id]])
+                except (ConverterError, OSError) as exc:
+                    _issue(report, exc, source.path)
+                    _block_source(db, source_id, blocked)
+                    for item in old_days.values():
+                        blocking_codes[item["partition"]].add(source.code)
+                else:
+                    reuse_key = "scope_reused_files" if receipt is not None else "stat_reused_files"
+                    reused_days = sum(_selected(day, config) for day in old_days)
+                    report["counts"][reuse_key] += 1
+                    report["counts"]["reused_days"] += reused_days
+                    relevant = {item["partition"] for day, item in old_days.items()
+                                if _partition_in_scope(day, source.period, config)}
+                    reused_sources[source_id] = (source_info[source_id], relevant, reuse_key, reused_days)
+                    if receipt is not None:
+                        report["issues"].extend(json.loads(receipt["warnings"]))
+                _emit(progress, event="source_complete", index=index + 1, total=len(sources), code=source.code, period=source.period)
                 continue
-            old_days = {item["day"]: item for item in db.execute("SELECT * FROM days WHERE source_id=?", (source_id,))}
             try:
                 snapshot = read_snapshot(source.path, source_root=config.source, expected_signature=source.signature)
                 source_info[source_id] = {"path": relative, "signature": snapshot.signature, "sha256": snapshot.sha256}
                 report["counts"]["content_revalidated_files"] += 1
                 if old["signature"] and snapshot.signature["size"] < json.loads(old["signature"])["size"]:
                     raise ConverterError("source-shrunk")
-                decoded = decode(snapshot, source, validation_start=config.start, validation_end=config.end)
+                decoded = decode(snapshot, source, start=config.start, end=config.end,
+                                 validation_start=config.start, validation_end=config.end,
+                                 extra_timestamps=evidence.timestamps(source))
                 for warning in decoded.warnings:
                     report["issues"].append({**warning, "path": str(source.path)})
-                if set(old_days) - set(decoded.days):
+                if set(old_days) - set(decoded.source_days):
                     raise ConverterError("removed-days")
                 evidence.compare(source, decoded.table)
                 wanted = set()
@@ -192,7 +327,15 @@ def _process(config, root, sources, report, action, progress, cancel):
                         wanted.add(day)
                 if wanted:
                     _stage(root, db, report["run_id"], source_id, source, decoded, wanted)
-                completed_candidates[source_id] = (source_info[source_id], len(decoded.days), config.start is None and config.end is None)
+                manifest = {day: {**detail, "partition": partition_path(source, day)}
+                            for day, detail in decoded.days.items() if _selected(day, config)}
+                warnings = [{**warning, "path": str(source.path)} for warning in decoded.warnings]
+                relevant = {detail["partition"] for detail in manifest.values()}
+                relevant.update(item["partition"] for day, item in old_days.items()
+                                if _partition_in_scope(day, source.period, config))
+                completed_candidates[source_id] = (source_info[source_id], len(decoded.source_days),
+                                                  config.start is None and config.end is None,
+                                                  manifest, warnings, (source.period, source.market, source.kind), relevant)
                 del decoded, snapshot
             except (ConverterError, OSError, ValueError, pa.ArrowException, sqlite3.Error) as exc:
                 _issue(report, exc, source.path)
@@ -214,6 +357,7 @@ def _process(config, root, sources, report, action, progress, cancel):
         if external["status"] == "mismatch":
             _issue(report, "evidence-mismatch-or-missing-scope")
         partitions = [row[0] for row in db.execute("SELECT DISTINCT partition FROM pending WHERE run=? ORDER BY partition", (report["run_id"],))]
+        progress.phase("publish")
         for index, partition in enumerate(partitions):
             _check_cancel(cancel)
             _emit(progress, event="partition", index=index + 1, total=len(partitions), path=partition)
@@ -237,8 +381,9 @@ def _process(config, root, sources, report, action, progress, cancel):
                 if info is not None:
                     identities.append(info)
             if unpublishable:
-                _issue(report, "partition-unpublishable", partition)
-                report["issues"][-1]["blocking_codes"] = sorted(causes)
+                _issue(report, "partition-unpublishable", partition, blocking_codes=sorted(causes))
+                blocked.add(partition)
+                _emit(progress, event="partition_complete", index=index + 1, total=len(partitions), path=partition)
                 continue
             try:
                 target = safe_path(root, partition)
@@ -267,18 +412,63 @@ def _process(config, root, sources, report, action, progress, cancel):
                 existing = incoming = combined = None
             _emit(progress, event="partition_complete", index=index + 1, total=len(partitions), path=partition)
         if action == "convert":
+            _check_cancel(cancel)
+            # Callbacks (or external edits) may change a committed output after
+            # its publication event. Check each relevant public file once more
+            # before granting a receipt, including sources with no pending work.
+            candidate_partitions = {partition for candidate in completed_candidates.values() for partition in candidate[6]}
+            candidate_partitions.update(partition for reused in reused_sources.values() for partition in reused[1])
+            for partition in sorted(candidate_partitions - blocked):
+                try:
+                    known = db.execute("SELECT * FROM partitions WHERE path=?", (partition,)).fetchone()
+                    target = safe_path(root, partition)
+                    if known is None:
+                        raise ConverterError("output-missing-or-untracked")
+                    if _signature(target) != json.loads(known["signature"]) and file_hash(target) != known["sha256"]:
+                        raise ConverterError("output-tampered")
+                except (ConverterError, OSError) as exc:
+                    _issue(report, exc, partition)
+                    blocked.add(partition)
+            # Reused sources also need end-of-run corroboration: an earlier
+            # checked set is only a historical observation. This uses metadata
+            # and output hashes, preserving the unchanged DAT fast path.
+            for source_id, (info, relevant, reuse_key, reused_days) in reused_sources.items():
+                _check_cancel(cancel)
+                valid = not relevant.intersection(blocked)
+                try:
+                    check_sources(config.source, [info])
+                except (ConverterError, OSError) as exc:
+                    _issue(report, exc, config.source / info["path"])
+                    valid = False
+                if not valid:
+                    report["counts"][reuse_key] -= 1
+                    report["counts"]["reused_days"] -= reused_days
             with db:
-                for source_id, (info, day_count, full_file) in completed_candidates.items():
+                for source_id, (info, day_count, full_file, manifest, warnings, group, relevant) in completed_candidates.items():
+                    _check_cancel(cancel)
                     pending = db.execute("SELECT 1 FROM pending WHERE run=? AND source_id=? LIMIT 1", (report["run_id"], source_id)).fetchone()
                     count = db.execute("SELECT COUNT(*) FROM days WHERE source_id=?", (source_id,)).fetchone()[0]
-                    if pending is None:
+                    if pending is None and not evidence_failed and not relevant.intersection(blocked) and group not in block_all:
+                        try:
+                            check_sources(config.source, [info])
+                        except (ConverterError, OSError) as exc:
+                            _issue(report, exc, config.source / info["path"])
+                            continue
                         db.execute("UPDATE sources SET signature=?,sha256=?,complete=?,day_count=? WHERE id=?",
-                                   (json.dumps(info["signature"], sort_keys=True), info["sha256"], int(full_file and count == day_count), count, source_id))
+                                   (json.dumps(info["signature"], sort_keys=True), info["sha256"], int(full_file and count == day_count), day_count, source_id))
+                        signature = json.dumps(info["signature"], sort_keys=True)
+                        db.execute("DELETE FROM scope_receipts WHERE source_id=? AND signature!=?", (source_id, signature))
+                        if config.start or config.end:
+                            start, end = _bounds(config)
+                            db.execute("INSERT OR REPLACE INTO scope_receipts VALUES (?,?,?,?,?,?,?,?,?)",
+                                       (source_id, start, end, signature, info["sha256"], RULE_VERSION, VALIDATION_VERSION,
+                                        json.dumps(warnings), json.dumps(manifest)))
         errors = any(item["category"] == "error" for item in report["issues"])
         report["verification"]["conversion_consistency"].update(
             status="failed" if errors else "verified" if sources else "unverified",
             method="content-comparison" if action == "verify" else "readback-and-cached-fingerprints",
             stat_reused_files=report["counts"]["stat_reused_files"],
+            scope_reused_files=report["counts"]["scope_reused_files"],
             content_revalidated_files=report["counts"]["content_revalidated_files"])
     finally:
         journals = list(safe_path(root, ".journal").glob("*.json"))
@@ -305,14 +495,18 @@ def run(config, action="convert", progress=None, cancel=None) -> dict:
                         "periods": list(config.periods), "codes": list(config.codes),
                         "start": config.start, "end": config.end, "mode": config.mode},
               "elapsed_seconds": 0.0,
+              "timings": {}, "issue_counts": {"error": 0, "warning": 0, "excluded": 0, "malformed": 0},
               "counts": {key: 0 for key in ("source_files", "new_days", "revised_days", "reused_days", "written_partitions",
-                         "stat_reused_files", "content_revalidated_files", "checked_partitions", "content_verified_partitions",
+                         "stat_reused_files", "scope_reused_files", "content_revalidated_files", "checked_partitions", "content_verified_partitions",
                          "recovered_partitions", "recovery_revalidated_files")},
               "issues": [], "paths": {"source": str(config.source), "output": str(config.output),
                                       "report": None, "text_report": None},
               "verification": initial_verification()}
+    progress = _Progress(report, progress, started)
+    report["issues"] = _LiveIssues(progress)
     report["verification"]["conversion_consistency"]["validation_scope"] = {"start": config.start, "end": config.end}
     try:
+        progress.phase("scan")
         if action not in {"convert", "scan", "verify"}:
             raise ConverterError("invalid-action")
         sources, issues = scan_sources(config)
@@ -332,15 +526,23 @@ def run(config, action="convert", progress=None, cancel=None) -> dict:
             except (ConverterError, OSError, ValueError, pa.ArrowException, sqlite3.Error) as exc:
                 report["status"] = "failed"
                 _issue(report, exc)
+            progress.phase("report")
             report_path = safe_path(root, f"reports/{run_id}.json")
             text_path = safe_path(root, f"reports/{run_id}.txt")
             report["paths"]["report"] = str(report_path)
             report["paths"]["text_report"] = str(text_path)
-            report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+            write_text_report(text_path, report)
+            progress.finish()
             write_text_report(text_path, report)
             write_json(report_path, report)
     except (ConverterError, OSError, ValueError, pa.ArrowException, sqlite3.Error) as exc:
         report["status"] = "failed"
         report["paths"]["report"] = None
+        # The final files contain a frozen timing snapshot. If a final write
+        # fails after freezing, retain that failed report stage's full duration.
+        if progress.current is None and "report" in report["timings"]:
+            progress.current = "report"
         _issue(report, exc)
+    finally:
+        progress.finish()
     return report

@@ -10,6 +10,7 @@ from tkinter import filedialog, ttk
 
 from .engine import run
 from .model import Config, ConverterError
+from .progress_view import ProgressPanel
 from .settings import DEFAULT_CONFIG, load_settings, resolve_local_path, save_settings
 
 
@@ -36,6 +37,10 @@ class ConverterApp:
         self.preview_id = None
         self.form_revision = 0
         self.job_revision = None
+        self.last_scan_key = None
+        self.last_scan_count = None
+        self.job_scan_key = None
+        self._destroyed = False
         self.source_var = tk.StringVar(value=settings["source"])
         self.output_var = tk.StringVar(value=settings["output"])
         self.period_var = tk.StringVar(value={"1d": "日线", "1m": "分钟线", "both": "日线 + 分钟线"}[settings["period"]])
@@ -47,7 +52,7 @@ class ConverterApp:
         self.status_var = tk.StringVar(value=config_error or "待命；首次使用请填写目录并保存本机配置")
 
         root.title("QMT DAT 离线转换")
-        root.minsize(640, 480)
+        root.minsize(640, 650)
         root.protocol("WM_DELETE_WINDOW", self.close)
         frame = ttk.Frame(root, padding=16)
         frame.pack(fill="both", expand=True)
@@ -90,11 +95,32 @@ class ConverterApp:
         ttk.Separator(frame).grid(row=8, column=0, columnspan=3, sticky="ew", pady=8)
         ttk.Label(frame, textvariable=self.status_var, wraplength=590, justify="left").grid(
             row=9, column=0, columnspan=3, sticky="nw")
+        self.progress_panel = ProgressPanel(frame, open_report=self.open_report)
+        self.progress_panel.grid(row=10, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
+        frame.rowconfigure(10, weight=1)
 
-        for variable in (self.source_var, self.output_var, self.period_var, self.codes_var,
-                         self.start_var, self.end_var, self.mode_var):
-            variable.trace_add("write", self._scope_changed)
+        self._trace_handles = [
+            (variable, variable.trace_add("write", self._scope_changed))
+            for variable in (self.source_var, self.output_var, self.period_var, self.codes_var,
+                             self.start_var, self.end_var)
+        ]
+        self._trace_handles.append((self.mode_var, self.mode_var.trace_add("write", lambda *_: self._update_scope())))
+        root.bind("<Destroy>", self._on_root_destroy, add="+")
         self._update_scope()
+
+    def _on_root_destroy(self, event):
+        if event.widget is not self.root or self._destroyed:
+            return
+        self._destroyed = True
+        if self.preview_id is not None:
+            self.root.after_cancel(self.preview_id)
+            self.preview_id = None
+        for variable, handle in self._trace_handles:
+            variable.trace_remove("write", handle)
+        self._trace_handles.clear()
+        for name in ("source_var", "output_var", "period_var", "codes_var", "start_var", "end_var",
+                     "mode_var", "scope_var", "status_var"):
+            setattr(self, name, None)
 
     def _folder_row(self, frame, row, label, variable):
         ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=6)
@@ -111,7 +137,14 @@ class ConverterApp:
         period = ", ".join(PERIODS.get(self.period_var.get(), ()))
         self.scope_var.set(f"请求范围：{period}；代码 {self.codes_var.get().strip() or '全部可识别'}；"
                            f"{self.start_var.get().strip() or '不限'} 至 "
-                           f"{self.end_var.get().strip() or '不限'}；{self.mode_var.get()}。")
+                           f"{self.end_var.get().strip() or '不限'}；{self.mode_var.get()}。"
+                           + (f" 已识别 {self.last_scan_count} 个源文件。"
+                              if self.last_scan_key == self._scan_key() and self.last_scan_count is not None else ""))
+
+    def _scan_key(self):
+        return (self.source_var.get().strip(), self.output_var.get().strip(),
+                self.period_var.get(), self.codes_var.get().strip(),
+                self.start_var.get().strip(), self.end_var.get().strip())
 
     def _scope_changed(self, *_):
         self.form_revision += 1
@@ -122,7 +155,8 @@ class ConverterApp:
 
     def _auto_scan(self):
         self.preview_id = None
-        if (not self.worker and self.source_var.get().strip() and self.output_var.get().strip()
+        if (not self.worker and self.last_scan_key != self._scan_key()
+                and self.source_var.get().strip() and self.output_var.get().strip()
                 and Path(resolve_local_path(self.source_var.get(), self.config_path)).is_dir()):
             self.start_job("scan")
 
@@ -164,12 +198,14 @@ class ConverterApp:
             return
         self.last_report = None
         self.job_revision = self.form_revision
+        self.job_scan_key = self._scan_key() if action == "scan" else None
         self.cancel_event.clear()
         self.report_button.configure(state="disabled")
         self.convert_button.configure(state="disabled")
         self.verify_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
         self.status_var.set("正在扫描…" if action == "scan" else "正在处理…")
+        self.progress_panel.begin(action)
 
         def work():
             try:
@@ -192,25 +228,31 @@ class ConverterApp:
                     kind, payload = event
                     finished = True
                     if kind == "done":
-                        if payload["action"] == "scan" and self.job_revision != self.form_revision:
+                        if payload.get("action") == "scan" and self.job_revision != self.form_revision:
                             self.status_var.set("范围已修改，正在重新扫描…")
                         else:
                             self.last_report = payload
-                            counts = payload["counts"]
-                            self.status_var.set(f"{payload['action']}: {payload['status']}；识别 {counts.get('source_files', 0)} 个源文件；"
-                                                f"已写入 {counts.get('written_partitions', 0)} 个分区；问题 {len(payload['issues'])} 条")
-                            if payload["action"] == "scan":
-                                self.scope_var.set(self.scope_var.get() + f" 已识别 {counts.get('source_files', 0)} 个源文件；"
-                                                   f"排除 {sum(item['category'] != 'error' for item in payload['issues'])} 项。")
-                            if payload["paths"].get("text_report"):
+                            self.progress_panel.finish(payload)
+                            self.status_var.set(self.progress_panel.result_var.get())
+                            if payload.get("action") == "scan":
+                                if payload.get("status") == "complete":
+                                    self.last_scan_key = self.job_scan_key
+                                    self.last_scan_count = (payload.get("counts") or {}).get("source_files", 0)
+                                else:
+                                    self.last_scan_key = None
+                                    self.last_scan_count = None
+                                self._update_scope()
+                            if (payload.get("paths") or {}).get("text_report"):
                                 self.report_button.configure(state="normal")
                     else:
                         self.status_var.set(f"处理失败：{payload}")
-                elif event.get("event") in {"source", "partition"}:
-                    target = event.get("code", event.get("path", ""))
-                    self.status_var.set(f"{event['event']} {event['index']}/{event['total']}  {target}")
+                        self.progress_panel.fail(payload)
+                elif isinstance(event, dict):
+                    self.progress_panel.consume(event)
         except Empty:
             pass
+        if self.worker is not None and not finished:
+            self.progress_panel.tick()
         if finished:
             self.worker.join()
             self.worker = None
@@ -240,7 +282,7 @@ class ConverterApp:
             self.root.destroy()
 
     def open_report(self):
-        if self.last_report and self.last_report["paths"].get("text_report"):
+        if self.last_report and (self.last_report.get("paths") or {}).get("text_report"):
             os.startfile(self.last_report["paths"]["text_report"])
 
 

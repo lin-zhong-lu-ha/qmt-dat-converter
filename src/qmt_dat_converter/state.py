@@ -11,6 +11,7 @@ from .model import ConverterError
 
 
 RULE_VERSION = "qmt-business-v2"
+VALIDATION_VERSION = "qmt-scope-validation-v1"
 MARKER = ".qmt-converter.json"
 
 
@@ -143,6 +144,14 @@ def connect(root: Path):
             PRIMARY KEY(run, source_id, day)
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS pending_partition ON pending(run, partition);
+        CREATE TABLE IF NOT EXISTS scope_receipts (
+            source_id INTEGER NOT NULL REFERENCES sources(id),
+            start TEXT NOT NULL, end TEXT NOT NULL,
+            signature TEXT NOT NULL, sha256 TEXT NOT NULL,
+            rule_version TEXT NOT NULL, validation_version TEXT NOT NULL,
+            warnings TEXT NOT NULL, days TEXT NOT NULL,
+            PRIMARY KEY(source_id, start, end)
+        ) WITHOUT ROWID;
     """)
     return db
 

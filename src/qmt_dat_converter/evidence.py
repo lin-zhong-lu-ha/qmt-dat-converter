@@ -59,6 +59,9 @@ class Evidence:
     def needs(self, source):
         return (source.code, source.period) in self.expected
 
+    def timestamps(self, source) -> tuple[int, ...]:
+        return tuple(item["timestamp"] for _, item in self.expected.get((source.code, source.period), ()))
+
     def compare(self, source, table):
         requests = self.expected.get((source.code, source.period), [])
         if not requests:

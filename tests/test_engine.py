@@ -73,7 +73,8 @@ def test_range_union_matches_full_and_never_deletes_other_codes(setup, dat_file,
     expected = pq.read_table(config.output.with_name("whole") / target.relative_to(config.output))
     assert pq.read_table(target).equals(expected)
     result = run(day)
-    assert result["counts"]["content_revalidated_files"] == 2
+    assert result["counts"]["content_revalidated_files"] == 0
+    assert result["counts"]["scope_reused_files"] == 2
     assert result["counts"]["written_partitions"] == 0
 
 

@@ -82,3 +82,4 @@ class Decoded:
     days: dict[str, dict]
     profile: str
     warnings: tuple[dict, ...] = ()
+    source_days: tuple[str, ...] = ()
